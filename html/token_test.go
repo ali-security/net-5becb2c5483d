@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -830,6 +840,89 @@ func TestSelfClosingTagValueConfusion(t *testing.T) {
 	tok := z.Next()
 	if tok != StartTagToken {
 		t.Fatalf("unexpected token type: got %s, want %s", tok, StartTagToken)
+	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+// TestDuplicateAttributes checks that a repeated attribute name is dropped, per
+// WHATWG 13.2.5.33, on every path that exposes a tag's attributes. Keeping the
+// later occurrences desynchronizes this package from a browser, which keeps
+// only the first: a sanitizer that inspects or re-serializes a later occurrence
+// can then be talked into approving a hostile first one.
+func TestDuplicateAttributes(t *testing.T) {
+	// A browser resolves this <a> to href="javascript:alert(1)".
+	const payload = `<a href="javascript:alert(1)" HREF="https://example.com/safe">x</a>`
+
+	// Low-level TagAttr API.
+	z := NewTokenizer(strings.NewReader(payload))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("TagAttr: got %s, want StartTagToken", tt)
+	}
+	z.TagName()
+	var keys, vals []string
+	for more := true; more; {
+		var k, v []byte
+		k, v, more = z.TagAttr()
+		keys = append(keys, string(k))
+		vals = append(vals, string(v))
+	}
+	if len(keys) != 1 || keys[0] != "href" || vals[0] != "javascript:alert(1)" {
+		t.Errorf(`TagAttr: got keys %q values %q, want just "href"="javascript:alert(1)"`, keys, vals)
+	}
+
+	// Tree construction and re-serialization, as a sanitizer would use it.
+	doc, err := Parse(strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := buf.String(); strings.Count(got, "href=") != 1 ||
+		!strings.Contains(got, `href="javascript:alert(1)"`) {
+		t.Errorf("Render: got %q, want exactly one href, the first one", got)
+	}
+
+	// The seen-name set must be reset per tag, and must also cover valueless
+	// attributes, self-closing tags and end tags.
+	for _, tc := range []struct {
+		html, want string
+	}{
+		{`<p foo="bar"><q foo="baz">`, `<p foo="bar">$<q foo="baz">`},
+		{`<p a a="1" A>`, `<p a="">`},
+		{`<img src="a" src="b"/>`, `<img src="a"/>`},
+		{`<p a="1" a="2"></p a="3" a="4">`, `<p a="1">$</p>`},
+	} {
+		z := NewTokenizer(strings.NewReader(tc.html))
+		for i, want := range strings.Split(tc.want, "$") {
+			if tt := z.Next(); tt == ErrorToken {
+				t.Fatalf("%s token %d: want %q, got error %v", tc.html, i, want, z.Err())
+			}
+			if got := z.Token().String(); got != want {
+				t.Errorf("%s token %d: got %q, want %q", tc.html, i, got, want)
+			}
+		}
 	}
 }
 
