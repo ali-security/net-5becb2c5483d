@@ -1,0 +1,82 @@
+# Authored by Seal: upstream golang.org/x/net has no GitHub Actions CI (it is
+# developed on Gerrit at go.googlesource.com/net and tested by the Go build
+# dashboard), so this workflow runs the project's own build and test commands --
+# `go build ./...` and `go test ./...` -- on the toolchain its go.mod requires,
+# and packs the module source zip that proxy.golang.org serves as the release
+# artifact.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run. Empty runs the full suite.
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # go.mod declares `go 1.24.0` as the minimum toolchain for this release.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Report toolchain
+        run: go version
+
+      # The public module zip is packed from the module tree. Upstream ships no
+      # .github directory, so the CI scaffolding added here is staged out to keep
+      # the zip's member set identical to the published one.
+      - name: Stage module tree
+        run: |
+          set -eux
+          mkdir -p /tmp/modsrc /tmp/build_output
+          rsync -a --exclude=.git --exclude=.github "$GITHUB_WORKSPACE"/ /tmp/modsrc/
+
+      # Packed before build/test so no build byproduct can reach the artifact.
+      - name: Pack module zip
+        run: |
+          set -eux
+          mkdir -p /tmp/modzip
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" /tmp/modzip/create_mod.go
+          cd /tmp/modzip
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 /tmp/modsrc /tmp/build_output/v0.45.0.zip
+          unzip -l /tmp/build_output/v0.45.0.zip | tail -n 3
+
+      - name: Build
+        run: go build ./...
+
+      # Full suite by default; a non-empty test-filter runs only the named tests.
+      # go test exits 0 when -run matches nothing, so each selected name must
+      # show its own `=== RUN` line or the step fails.
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -count=1 -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || {
+                echo "selected test ${t} never ran"; exit 1;
+              }
+            done
+          else
+            go test -count=1 ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/build_output/v0.45.0.zip
+          if-no-files-found: error
